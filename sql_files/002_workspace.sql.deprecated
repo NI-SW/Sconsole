@@ -1,0 +1,74 @@
+-- Sconsole Database Schema v2 — Agent Workspace Architecture
+-- OceanBase MySQL compatible
+
+-- ─── Add columns to SCL_agent_instances ──────────────────────────────
+
+-- Check and add 'name' column
+SET @col_exists = (SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = 'SCL_console' AND TABLE_NAME = 'SCL_agent_instances' AND COLUMN_NAME = 'name');
+SET @sql = IF(@col_exists = 0,
+    'ALTER TABLE SCL_agent_instances ADD COLUMN name VARCHAR(255) NOT NULL DEFAULT ''''',
+    'SELECT ''name column already exists''');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- Check and add 'description' column
+SET @col_exists = (SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = 'SCL_console' AND TABLE_NAME = 'SCL_agent_instances' AND COLUMN_NAME = 'description');
+SET @sql = IF(@col_exists = 0,
+    'ALTER TABLE SCL_agent_instances ADD COLUMN description TEXT COMMENT ''Instance description''',
+    'SELECT ''description column already exists''');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- ─── Create SCL_instance_agents ─────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS SCL_instance_agents (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    instance_id     INT NOT NULL COMMENT 'FK to SCL_agent_instances',
+    config_id       INT NOT NULL COMMENT 'FK to SCL_agent_configs',
+    name            VARCHAR(255) NOT NULL DEFAULT '' COMMENT 'Agent name within the instance',
+    container_id    VARCHAR(255) NOT NULL DEFAULT '' COMMENT 'Docker/Podman container ID',
+    host_port       INT NOT NULL DEFAULT 0 COMMENT 'Host port mapped to container API port',
+    api_key         VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'Agent API key for hermes gateway',
+    status          ENUM('pending','deploying','running','stopped','error') NOT NULL DEFAULT 'pending',
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_instance (instance_id),
+    INDEX idx_config (config_id),
+    INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Agents running inside a workspace instance';
+
+-- ─── Migrate existing data ──────────────────────────────────────────
+
+INSERT INTO SCL_instance_agents (instance_id, config_id, name, container_id, host_port, api_key, status, created_at)
+SELECT t.id, t.config_id, CONCAT('Agent-', t.id), t.container_id, t.host_port, t.api_key, t.status, t.created_at
+FROM SCL_agent_instances t
+WHERE t.container_id != ''
+  AND NOT EXISTS (SELECT 1 FROM SCL_instance_agents a WHERE a.instance_id = t.id);
+
+UPDATE SCL_agent_instances SET name = CONCAT('Workspace #', id) WHERE name = '' OR name IS NULL;
+
+-- ─── Agent Conversations (hermes monitor / communicate) ──────────────
+
+CREATE TABLE IF NOT EXISTS SCL_agent_conversations (
+    id                INT AUTO_INCREMENT PRIMARY KEY,
+    instance_id       INT NOT NULL COMMENT 'FK to SCL_agent_instances',
+    agent_id          INT NOT NULL DEFAULT 0 COMMENT 'FK to SCL_instance_agents',
+    conversation_id   VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'Hermes conversation ID',
+    user_input        TEXT COMMENT 'User input / query',
+    output            JSON COMMENT 'Full hermes output array (function_calls, messages, etc.)',
+    usage_info        JSON COMMENT 'Token usage info (input_tokens, output_tokens, total_tokens)',
+    status            VARCHAR(32) NOT NULL DEFAULT 'completed' COMMENT 'completed, in_progress, error',
+    error_msg         TEXT COMMENT 'Error message if any',
+    created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_instance (instance_id),
+    INDEX idx_agent (agent_id),
+    INDEX idx_conversation (conversation_id),
+    INDEX idx_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='Hermes agent conversation tracking for monitor view';
+
+-- Verify
+SELECT 'Migration complete' AS status;
+SELECT COUNT(*) AS instances FROM SCL_agent_instances;
+SELECT COUNT(*) AS agents FROM SCL_instance_agents;

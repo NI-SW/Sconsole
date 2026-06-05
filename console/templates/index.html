@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sconsole - 工作空间管理控制台</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">S</div>
+                <h1>Sconsole</h1>
+            </div>
+            <div class="header-right">
+                <span id="server-status" class="status-dot offline"></span>
+                <span id="status-text">Disconnected</span>
+                <span id="node-count" class="badge">0 nodes</span>
+            </div>
+        </header>
+
+        <!-- Main Layout -->
+        <div class="main-layout">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <nav class="nav-menu">
+                    <button class="nav-item active" data-view="dashboard">
+                        <span class="nav-icon">&#9674;</span> 概览
+                    </button>
+                    <button class="nav-item" data-view="agents">
+                        <span class="nav-icon">&#9881;</span> 工作空间
+                    </button>
+                    <button class="nav-item" data-view="chat">
+                        <span class="nav-icon">&#9993;</span> 对话
+                    </button>
+                    <button class="nav-item" data-view="configs">
+                        <span class="nav-icon">&#9883;</span> 配置
+                    </button>
+                    <button class="nav-item" data-view="nodes">
+                        <span class="nav-icon">&#9701;</span> 节点
+                    </button>
+                    <button class="nav-item" data-view="skills">
+                        <span class="nav-icon">&#9733;</span> 技能
+                    </button>
+                </nav>
+            </aside>
+
+            <!-- Content Area -->
+            <main class="content">
+
+                <!-- 概览视图 -->
+                <section id="view-dashboard" class="view active">
+                    <h2>概览</h2>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-value" id="stat-nodes">0</div>
+                            <div class="stat-label">Online Nodes</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="stat-agents">0</div>
+                            <div class="stat-label">Running Agents</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="stat-configs">0</div>
+                            <div class="stat-label">Configurations</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value" id="stat-messages">0</div>
+                            <div class="stat-label">Messages Today</div>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <h3>Recent Activity</h3>
+                        <div id="activity-log" class="log-area">
+                            <div class="log-entry system">System ready. Connect to server to begin.</div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 工作空间视图 -->
+                <section id="view-agents" class="view">
+                    <div class="view-header">
+                        <h2>工作空间</h2>
+                        <button class="btn btn-primary" onclick="switchView('create-workspace')">+ 新建工作空间</button>
+                    </div>
+                    <div id="agent-batch-bar" class="batch-bar hidden">
+                        <label class="batch-check-all"><input type="checkbox" id="check-all" onchange="toggleSelectAll()"> Select All</label>
+                        <span id="batch-count" class="batch-count">0 selected</span>
+                        <button class="btn btn-sm btn-danger" onclick="batchStop()">Stop Selected</button>
+                        <button class="btn btn-sm btn-danger" onclick="batchDelete()">Delete Selected</button>
+                    </div>
+                    <div id="agent-list" class="card-list"></div>
+                </section>
+
+                <!-- 对话视图 (全页) -->
+                <section id="view-chat" class="view">
+                    <div class="chat-page">
+                        <!-- 未选择 Agent -->
+                        <div id="chat-empty" class="chat-empty">
+                            <div class="chat-empty-icon">&#9993;</div>
+                            <h2>Agent 对话</h2>
+                            <p>选择一个运行中的 Agent 开始对话。</p>
+                            <div id="chat-agent-selector" class="chat-selector">
+                                <p class="text-muted">正在加载 Agent 列表...</p>
+                            </div>
+                        </div>
+
+                        <!-- Active chat -->
+                        <div id="chat-active" class="chat-active hidden">
+                            <div class="chat-topbar">
+                                <button class="btn btn-sm" onclick="closeChatView()">&#8592; Back</button>
+                                <div class="chat-agent-info">
+                                    <span class="chat-agent-status status-dot online"></span>
+                                    <strong id="chat-agent-name">Agent #--</strong>
+                                    <span class="text-muted" id="chat-agent-model"></span>
+                                </div>
+                                <span class="badge" id="chat-agent-port"></span>
+                                <label class="btn btn-sm chat-upload-btn" title="上传文件到 Agent 共享目录">
+                                    📎 <input type="file" id="chat-file-input" onchange="handleChatFileUpload(this)" style="display:none">
+                                </label>
+                            </div>
+                            <div class="chat-body">
+                                <!-- Conversation list sidebar -->
+                                <div class="chat-sidebar" id="chat-sidebar">
+                                    <div class="chat-sidebar-header">
+                                        <span class="chat-sidebar-title">会话</span>
+                                        <button class="btn btn-sm btn-primary" onclick="newConversation()" title="新建会话">+</button>
+                                    </div>
+                                    <div class="chat-sidebar-list" id="chat-conv-list">
+                                        <div class="chat-conv-item active" data-conv-id="">
+                                            <div class="chat-conv-preview">当前会话</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Main chat area -->
+                                <div class="chat-main">
+                                    <div id="chat-messages" class="chat-messages-full"></div>
+                                    <div class="chat-input-bar">
+                                        <textarea id="chat-input" placeholder="Type your message... (Shift+Enter for new line, Enter to send)" onkeydown="handleChatKey(event)" rows="1"></textarea>
+                                        <button class="btn btn-primary" onclick="sendChatMessage()">Send</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 配置视图 -->
+                <section id="view-configs" class="view">
+                    <div class="view-header">
+                        <h2>Agent 配置</h2>
+                        <button class="btn btn-primary" onclick="showConfigForm()">+ 新建配置</button>
+                    </div>
+                    <div id="config-list" class="card-list"></div>
+                </section>
+                <!-- 节点视图 -->
+                <section id="view-nodes" class="view">
+                    <h2>计算节点</h2>
+                    <div id="node-list" class="card-list"></div>
+                </section>
+
+                <!-- 技能视图 -->
+                <section id="view-skills" class="view">
+                    <div class="view-header">
+                        <h2>Skills</h2>
+                        <button class="btn btn-primary" onclick="showSkillInstall()">+ Install Skill</button>
+                    </div>
+                    <div id="skill-list" class="card-list">
+                        <div class="empty-state">No skills installed yet.</div>
+                    </div>
+                    <div id="skill-install-panel" class="form-panel hidden">
+                        <h3>Install Skill</h3>
+                        <form onsubmit="installSkill(event)">
+                            <div class="form-group">
+                                <label>Skill Name</label>
+                                <input type="text" name="skill_name" required>
+                            </div>
+                            <div class="form-group">
+                                <label>Source (URL or path)</label>
+                                <input type="text" name="skill_source" required placeholder="https://... or /path/to/skill.zip">
+                            </div>
+                            <div class="form-actions">
+                                <button type="submit" class="btn btn-primary">Install</button>
+                                <button type="button" class="btn" onclick="hideSkillInstall()">Cancel</button>
+                            </div>
+                        </form>
+                    </div>
+                </section>
+
+
+                <!-- Create Workspace View -->
+                <section id="view-create-workspace" class="view">
+                    <div class="form-page">
+                        <div class="form-page-header">
+                            <button class="btn btn-sm" onclick="switchView('agents')">← Back</button>
+                            <h2>Create Workspace</h2>
+                        </div>
+                        <form id="create-workspace-form" onsubmit="submitWorkspace(event)" class="workspace-form">
+                        <div class="form-top-row">
+                            <div class="form-section">
+                                <label class="form-label">Workspace Name <span class="required">*</span></label>
+                                <input type="text" name="ws_name" class="form-input-lg" placeholder="e.g. AI Development Team" required autofocus>
+                            </div>
+                            <div class="form-section">
+                                <label class="form-label">Description</label>
+                                <textarea name="ws_desc" class="form-textarea" rows="2" placeholder="What is this workspace for?"></textarea>
+                            </div>
+                        </div>
+                        <div class="form-section">
+                            <label class="form-label">Target Node</label>
+                            <select name="ws_node" id="ws-node-select" class="form-select" style="max-width:300px">
+                                <option value="">-- Auto (first online) --</option>
+                            </select>
+                        </div>
+
+                            <div class="form-section">
+                                <div class="form-section-header">
+                                    <label class="form-label">Sub-Agents</label>
+                                    <button type="button" class="btn btn-sm btn-primary" onclick="addSubAgentRow()">+ Add Sub-Agent</button>
+                                </div>
+                                <p class="form-hint">Define the agents that will work together in this workspace.</p>
+                                <div id="sub-agent-rows" class="sub-agent-list"></div>
+                            </div>
+
+                            <div class="form-section">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" name="deploy_master" checked>
+                                    Deploy Master Agent immediately
+                                </label>
+                            </div>
+
+                            <div class="form-actions-bar">
+                                <button type="submit" class="btn btn-primary btn-lg">Create Workspace</button>
+                                <button type="button" class="btn" onclick="switchView('agents')">Cancel</button>
+                            </div>
+                        </form>
+                    </div>
+                </section>
+
+                <!-- Add Agent View -->
+                <section id="view-add-agent" class="view">
+                    <div class="form-page">
+                        <div class="form-page-header">
+                            <button class="btn btn-sm" onclick="switchView('agents')">← Back</button>
+                            <h2 id="add-agent-title">Add Agent</h2>
+                        </div>
+                        <form id="add-agent-form" onsubmit="submitAddAgent(event)" class="workspace-form">
+                            <input type="hidden" name="instance_id" id="add-agent-instance-id">
+                            <div class="form-section">
+                                <label class="form-label">Agent Name <span class="required">*</span></label>
+                                <input type="text" name="agent_name" class="form-input-lg" placeholder="e.g. Code Reviewer" required autofocus>
+                            </div>
+                            <div class="form-section">
+                                <label class="form-label">Config Template <span class="required">*</span></label>
+                                <select name="config_id" id="add-agent-config-select" class="form-select-lg" required>
+                                    <option value="">Loading templates...</option>
+                                </select>
+                            </div>
+                            <div class="form-section">
+                                <label class="form-label">Description / Role</label>
+                                <textarea name="agent_desc" class="form-textarea" rows="2" placeholder="What does this agent do? (used by Master for scheduling)"></textarea>
+                            </div>
+                            <div class="form-actions-bar">
+                                <button type="submit" class="btn btn-primary btn-lg">Deploy Agent</button>
+                                <button type="button" class="btn" onclick="switchView('agents')">Cancel</button>
+                            </div>
+                        </form>
+                    </div>
+                </section>
+
+            </main>
+        </div>
+    </div>
+
+    <!-- Logs Modal -->
+    <div id="logs-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeLogsModal()">
+        <div class="modal-container">
+            <div class="modal-header">
+                <h3 id="logs-modal-title">Agent Logs</h3>
+                <button class="btn btn-sm" onclick="closeLogsModal()">Close</button>
+            </div>
+            <div id="logs-modal-body" class="modal-body">
+                <div class="logs-loading">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Monitor Modal -->
+    <div id="monitor-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeMonitor()">
+        <div class="modal-container monitor-container">
+            <div class="modal-header">
+                <h3 id="monitor-modal-title">Agent Monitor</h3>
+                <button class="btn btn-sm" onclick="closeMonitor()">Close</button>
+            </div>
+            <div id="monitor-modal-body" class="modal-body">
+                <div class="monitor-loading">Loading conversation history...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Files Modal -->
+    <div id="files-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeFilesModal()">
+        <div class="modal-container">
+            <div class="modal-header">
+                <h3 id="files-modal-title">工作空间文件</h3>
+                <button class="btn btn-sm" onclick="closeFilesModal()">Close</button>
+            </div>
+            <div id="files-modal-body" class="modal-body">
+                <div class="files-loading">正在加载文件列表...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Config Edit Modal -->
+    <div id="config-form-panel" class="modal-overlay hidden" onclick="if(event.target===this)hideConfigForm()">
+        <div class="modal-container config-modal-container">
+            <div class="modal-header">
+                <h3 id="config-form-title">创建配置</h3>
+                <button class="btn btn-sm" onclick="hideConfigForm()">Cancel</button>
+            </div>
+            <div class="modal-body config-modal-body">
+                <form id="config-form" onsubmit="saveConfig(event)">
+                    <div class="config-grid">
+                        <!-- Card: Identity -->
+                        <div class="config-card-section">
+                            <h4 class="config-section-title">📛 身份</h4>
+                            <div class="form-group">
+                                <label>Name</label>
+                                <input type="text" name="name" required placeholder="My Agent">
+                            </div>
+                            <div class="form-group">
+                                <label>SOUL File (personality)</label>
+                                <textarea name="soul_file" rows="4" placeholder="You are a helpful assistant..."></textarea>
+                            </div>
+                            <div class="form-group">
+                                <label>MEMORY File</label>
+                                <textarea name="memory_file" rows="3" placeholder="User preferences and context..."></textarea>
+                            </div>
+                            <div class="form-group">
+                                <label>Technical Docs</label>
+                                <textarea name="tech_docs" rows="3" placeholder="API documentation, knowledge base..."></textarea>
+                            </div>
+                        </div>
+                        <!-- Card: Model -->
+                        <div class="config-card-section">
+                            <h4 class="config-section-title">🤖 模型</h4>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>API Provider</label>
+                                    <select name="model_provider" onchange="onProviderChange(this.value)">
+                                        <option value="">-- Auto-detect --</option>
+                                        <option value="openai">OpenAI</option>
+                                        <option value="openrouter">OpenRouter</option>
+                                        <option value="deepseek">DeepSeek</option>
+                                        <option value="anthropic">Anthropic</option>
+                                        <option value="xai">xAI (Grok)</option>
+                                        <option value="google">Google Gemini</option>
+                                        <option value="kimi">Kimi / Moonshot</option>
+                                        <option value="alibaba">Alibaba / DashScope</option>
+                                        <option value="minimax">MiniMax</option>
+                                        <option value="glm">Z.AI / GLM</option>
+                                        <option value="custom">Custom / Other</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>Model Name</label>
+                                    <input type="text" name="model_name" placeholder="gpt-4">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Model API URL</label>
+                                <input type="text" name="model_url" placeholder="https://api.openai.com/v1">
+                            </div>
+                            <div class="form-group">
+                                <label>API Key</label>
+                                <input type="password" name="model_api_key" placeholder="sk-...">
+                            </div>
+                        </div>
+                        <!-- Card: Network & Skills -->
+                        <div class="config-card-section">
+                            <h4 class="config-section-title">🔧 网络与技能</h4>
+                            <div class="form-group">
+                                <label>Proxy (for skill downloads)</label>
+                                <input type="text" name="proxy" placeholder="http://proxy:8080">
+                            </div>
+                            <div class="form-group">
+                                <label>Skills (comma-separated paths/URLs)</label>
+                                <input type="text" name="skills_str" placeholder="/path/to/skill, https://...">
+                            </div>
+                        </div>
+                    </div>
+                    <input type="hidden" name="config_id" value="">
+                    <div class="config-form-footer">
+                        <button type="submit" class="btn btn-primary">Save</button>
+                        <button type="button" class="btn" onclick="hideConfigForm()">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Workspace Config Modal -->
+    <div id="wsconfig-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeWSConfig()">
+        <div class="modal-container">
+            <div class="modal-header">
+                <h3 id="wsconfig-modal-title">工作空间配置</h3>
+                <button class="btn btn-sm" onclick="closeWSConfig()">Close</button>
+            </div>
+            <div id="wsconfig-modal-body" class="modal-body">
+                <div class="files-loading">正在加载...</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js?v=20260604e"></script>
+</body>
+</html>

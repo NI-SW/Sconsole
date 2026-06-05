@@ -1,0 +1,24 @@
+# Sconsole - Python Dependencies
+# Core dependencies for server and node
+
+# Web Framework
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# WebSocket support (node client)
+websockets>=11.0
+
+# Database
+pymysql>=1.1.0
+
+# Docker/Podman SDK
+docker>=6.0.0
+
+# HTTP client
+httpx>=0.24.0
+
+# YAML support
+pyyaml>=6.0
+
+# Static file serving
+aiofiles>=23.0
