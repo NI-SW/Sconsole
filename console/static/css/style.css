@@ -631,6 +631,10 @@ h3 {
 }
 
 .btn-sm { padding: 5px 12px; font-size: 12px; border-radius: 6px; }
+.btn-xs { padding: 2px 8px; font-size: 11px; border-radius: 4px; }
+.btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-secondary); cursor: pointer; }
+.btn-outline:hover { background: var(--bg-hover); color: var(--text); }
+.config-inline-upload { margin-left: 8px; vertical-align: middle; font-weight: normal; }
 
 /* ═══ Forms ════════════════════════════════════════════════════════ */
 

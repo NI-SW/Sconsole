@@ -331,15 +331,30 @@
                                 <input type="text" name="name" required placeholder="My Agent">
                             </div>
                             <div class="form-group">
-                                <label>SOUL File (personality)</label>
+                                <label>SOUL File (personality)
+                                    <label class="btn btn-xs btn-outline config-inline-upload">
+                                        📂 上传 .md
+                                        <input type="file" accept=".md,.txt,.markdown" onchange="loadTextFile(this, 'soul_file')" style="display:none">
+                                    </label>
+                                </label>
                                 <textarea name="soul_file" rows="4" placeholder="You are a helpful assistant..."></textarea>
                             </div>
                             <div class="form-group">
-                                <label>MEMORY File</label>
+                                <label>MEMORY File
+                                    <label class="btn btn-xs btn-outline config-inline-upload">
+                                        📂 上传 .md
+                                        <input type="file" accept=".md,.txt,.markdown" onchange="loadTextFile(this, 'memory_file')" style="display:none">
+                                    </label>
+                                </label>
                                 <textarea name="memory_file" rows="3" placeholder="User preferences and context..."></textarea>
                             </div>
                             <div class="form-group">
-                                <label>Technical Docs</label>
+                                <label>Technical Docs
+                                    <label class="btn btn-xs btn-outline config-inline-upload">
+                                        📂 上传 .md
+                                        <input type="file" accept=".md,.txt,.markdown" onchange="loadTextFile(this, 'tech_docs')" style="display:none">
+                                    </label>
+                                </label>
                                 <textarea name="tech_docs" rows="3" placeholder="API documentation, knowledge base..."></textarea>
                             </div>
                         </div>
@@ -374,7 +389,7 @@
                                 <input type="text" name="model_url" placeholder="https://api.openai.com/v1">
                             </div>
                             <div class="form-group">
-                                <label>API Key</label>
+                                <label>API Key <span id="api-key-hint" class="text-muted" style="font-size:11px;font-weight:normal"></span></label>
                                 <input type="password" name="model_api_key" placeholder="sk-...">
                             </div>
                         </div>

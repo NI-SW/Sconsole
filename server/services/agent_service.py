@@ -76,6 +76,9 @@ class AgentService:
         for key in allowed:
             if key in updates:
                 val = updates[key]
+                # Skip empty model_api_key — means "don't change"
+                if key == "model_api_key" and (val is None or val.strip() == ""):
+                    continue
                 if key in ("skills", "extra_env"):
                     val = json.dumps(val)
                 set_clauses.append(f"{key} = %s")
@@ -91,6 +94,31 @@ class AgentService:
                     values,
                 )
                 return cur.rowcount > 0
+
+    @staticmethod
+    def get_config_agent_refs(config_id: int) -> list:
+        """Return list of agents referencing this config."""
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT a.id, a.name, a.role, a.status, i.id as ws_id, i.name as ws_name "
+                    "FROM SCL_instance_agents a "
+                    "JOIN SCL_workspaces i ON a.instance_id = i.id "
+                    "WHERE a.config_id = %s",
+                    (config_id,),
+                )
+                rows = cur.fetchall()
+                return [
+                    {
+                        "agent_id": r[0],
+                        "agent_name": r[1],
+                        "role": r[2],
+                        "status": r[3],
+                        "workspace_id": r[4],
+                        "workspace_name": r[5],
+                    }
+                    for r in (rows or [])
+                ]
 
     @staticmethod
     def delete_config(config_id: int) -> bool:
@@ -212,9 +240,42 @@ class AgentService:
 
     @staticmethod
     def delete_instance(instance_id: int) -> bool:
+        """Delete a workspace and all its associated DB records (agents,
+        conversations, messages, files)."""
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM SCL_workspaces WHERE id = %s", (instance_id,))
+                # 1. Get all agent IDs for this workspace
+                cur.execute(
+                    "SELECT id FROM SCL_instance_agents WHERE instance_id = %s",
+                    (instance_id,),
+                )
+                agent_ids = [row[0] for row in cur.fetchall()]
+
+                # 2. Delete messages & conversations for each agent
+                if agent_ids:
+                    placeholders = ",".join(["%s"] * len(agent_ids))
+                    cur.execute(
+                        f"DELETE FROM SCL_agent_messages_v3 "
+                        f"WHERE instance_agent_id IN ({placeholders})",
+                        agent_ids,
+                    )
+                    # conversations uses (instance_id, agent_id), not instance_agent_id
+                    cur.execute(
+                        f"DELETE FROM SCL_agent_conversations "
+                        f"WHERE instance_id = %s AND agent_id IN ({placeholders})",
+                        [instance_id] + agent_ids,
+                    )
+
+                # 3. Delete agent records
+                cur.execute(
+                    "DELETE FROM SCL_instance_agents WHERE instance_id = %s",
+                    (instance_id,),
+                )
+
+                # 4. Finally delete the workspace itself
+                cur.execute(
+                    "DELETE FROM SCL_workspaces WHERE id = %s", (instance_id,)
+                )
                 return cur.rowcount > 0
 
     # ─── Instance Agent CRUD ──────────────────────────────────────────
@@ -482,6 +543,18 @@ class AgentService:
 
         with get_db() as conn:
             with conn.cursor() as cur:
+                # Cascade: delete messages & conversations first
+                cur.execute(
+                    "DELETE FROM SCL_agent_messages_v3 WHERE instance_agent_id = %s",
+                    (agent_id,),
+                )
+                # conversations uses (instance_id, agent_id)
+                if agent:
+                    cur.execute(
+                        "DELETE FROM SCL_agent_conversations WHERE instance_id = %s AND agent_id = %s",
+                        (agent["instance_id"], agent_id),
+                    )
+                # Then delete the agent record
                 cur.execute("DELETE FROM SCL_instance_agents WHERE id = %s", (agent_id,))
                 return cur.rowcount > 0
 
@@ -509,7 +582,7 @@ class AgentService:
                        ORDER BY id DESC LIMIT %s""",
                     (instance_agent_id, limit),
                 )
-                rows = cur.fetchall()
+                rows = list(cur.fetchall())
                 rows.reverse()
                 return [
                     {
@@ -690,7 +763,15 @@ class AgentService:
     # ─── Helpers ──────────────────────────────────────────────────────
 
     @staticmethod
+    def _mask_api_key(key: str) -> str:
+        """Return a masked version of an API key for display."""
+        if not key or len(key) <= 8:
+            return "****" if key else ""
+        return key[:4] + "****" + key[-4:]
+
+    @staticmethod
     def _row_to_config(row) -> dict:
+        raw_key = row[6]
         return {
             "id": row[0],
             "name": row[1],
@@ -698,7 +779,7 @@ class AgentService:
             "memory_file": row[3],
             "tech_docs": row[4],
             "model_url": row[5],
-            "model_api_key": row[6],
+            "model_api_key": AgentService._mask_api_key(raw_key or ""),
             "model_name": row[7],
             "model_provider": row[8] if len(row) > 8 else "",
             "proxy": row[9] if len(row) > 9 else "",

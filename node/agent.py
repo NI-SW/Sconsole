@@ -296,10 +296,10 @@ class DockerManager:
             logger.error(f"Failed to deploy agent {instance_id}: {e}")
             return None, 0
 
-    def stop_agent(self, instance_id: int, agent_id: int):
-        """Stop and remove an agent container."""
+    def stop_agent(self, instance_id: int, agent_id: int, remove_volumes: bool = True):
+        """Stop and remove an agent container, including anonymous volumes."""
         agent_name = f"agent-{instance_id}-{agent_id}"
-        self._remove_container(agent_name)
+        self._remove_container(agent_name, remove_volumes=remove_volumes)
         # Clean up shared directory
         agent_shared = os.path.join(SHARED_DIR, str(instance_id), str(agent_id))
         if os.path.isdir(agent_shared):
@@ -326,14 +326,14 @@ class DockerManager:
             except Exception as e2:
                 logger.warning(f"Retry restart also failed for {agent_name}: {e2}")
 
-    def _remove_container(self, name: str):
-        """Remove container if it exists."""
+    def _remove_container(self, name: str, remove_volumes: bool = False):
+        """Remove container if it exists. Optionally remove anonymous volumes."""
         try:
             container = self.client.containers.get(name)
             logger.info(f"Stopping container: {name}")
             container.stop(timeout=10)
-            container.remove(force=True)
-            logger.info(f"Container removed: {name}")
+            container.remove(force=True, v=remove_volumes)
+            logger.info(f"Container removed: {name}" + (" (with volumes)" if remove_volumes else ""))
         except Exception:
             pass  # Container not found or already removed
 
@@ -375,6 +375,90 @@ class DockerManager:
 
         if cleaned:
             logger.info(f"[Intercom] Cleaned for ws {workspace_id}: {', '.join(cleaned)}")
+
+    def clean_workspace_resources(self, workspace_id: int, agent_ids: list):
+        """Full cleanup of all resources for a deleted workspace.
+
+        Cleans:
+        1. Agent containers (stop + remove with volumes)
+        2. Agent shared directories under ~/.sconsole/shared/{ws_id}/
+        3. Workspace-level shared directory
+        4. Intercom registry & mailboxes
+        """
+        import subprocess
+        cleaned_items = []
+
+        # 1. Stop & remove each agent container with its volumes
+        for aid in (agent_ids or []):
+            agent_name = f"agent-{workspace_id}-{aid}"
+            try:
+                container = self.client.containers.get(agent_name)
+                container.stop(timeout=10)
+                container.remove(force=True, v=True)
+                cleaned_items.append(f"container+vol:{agent_name}")
+            except Exception:
+                pass  # Already removed
+
+            # Agent-level shared dir
+            agent_shared = os.path.join(SHARED_DIR, str(workspace_id), str(aid))
+            if os.path.isdir(agent_shared):
+                try:
+                    shutil.rmtree(agent_shared)
+                    cleaned_items.append(f"shared:{aid}")
+                except Exception:
+                    pass
+
+        # 2. Workspace-level shared directory
+        ws_shared = os.path.join(SHARED_DIR, str(workspace_id))
+        if os.path.isdir(ws_shared):
+            try:
+                shutil.rmtree(ws_shared)
+                cleaned_items.append(f"ws_shared:{workspace_id}")
+            except Exception:
+                pass
+
+        # 3. Intercom artifacts (registry + mailboxes)
+        reg_file = os.path.join(CONTAINER_VOLUME_DIR, "registry", f"{workspace_id}.json")
+        if os.path.exists(reg_file):
+            try:
+                os.remove(reg_file)
+                cleaned_items.append(f"registry/{workspace_id}.json")
+            except OSError:
+                pass
+
+        ids_to_clean = {workspace_id}
+        ids_to_clean.update(agent_ids or [])
+        for mid in ids_to_clean:
+            mailbox = os.path.join(CONTAINER_VOLUME_DIR, "mailbox", str(mid))
+            if os.path.isdir(mailbox):
+                try:
+                    shutil.rmtree(mailbox)
+                    cleaned_items.append(f"mailbox/{mid}")
+                except PermissionError:
+                    try:
+                        subprocess.run(
+                            ["podman", "unshare", "rm", "-rf", mailbox],
+                            capture_output=True, timeout=10,
+                        )
+                        if not os.path.isdir(mailbox):
+                            cleaned_items.append(f"mailbox/{mid}")
+                    except Exception:
+                        logger.warning(f"Failed to clean mailbox {mailbox}")
+
+        # 4. Prune anonymous volumes left by removed containers
+        try:
+            subprocess.run(
+                ["podman", "volume", "prune", "-f"],
+                capture_output=True, timeout=30,
+            )
+            cleaned_items.append("volume_prune")
+        except Exception:
+            pass
+
+        if cleaned_items:
+            logger.info(f"[WorkspaceCleanup] ws {workspace_id}: {', '.join(cleaned_items)}")
+        else:
+            logger.info(f"[WorkspaceCleanup] ws {workspace_id}: nothing to clean")
 
     def _write_agent_files(self, shared_dir: str, config: dict):
         """Write agent configuration files to shared directory."""
@@ -587,6 +671,8 @@ class NodeClient:
                     await self._handle_agent_input(msg)
                 elif msg_type == "clean_intercom":
                     await self._handle_clean_intercom(msg)
+                elif msg_type == "clean_workspace":
+                    await self._handle_clean_workspace(msg)
                 else:
                     logger.warning(f"Unknown message type: {msg_type}")
 
@@ -656,6 +742,16 @@ class NodeClient:
         agent_ids = msg.get("agent_ids", [])
         if self.docker_mgr:
             self.docker_mgr.clean_intercom_artifacts(workspace_id, agent_ids)
+
+    async def _handle_clean_workspace(self, msg: dict):
+        """Handle full cleanup of all workspace resources after deletion."""
+        workspace_id = msg.get("workspace_id") or msg.get("instance_id")
+        agent_ids = msg.get("agent_ids", [])
+        logger.info(f"Handling clean_workspace for ws {workspace_id}, agents={agent_ids}")
+        if self.docker_mgr:
+            await asyncio.get_event_loop().run_in_executor(
+                None, self.docker_mgr.clean_workspace_resources, workspace_id, agent_ids
+            )
 
     async def _send_status(self, instance_id: int, status: str, agent_id: int = 0,
                           container_id: str = "", host_port: int = 0, api_key: str = ""):

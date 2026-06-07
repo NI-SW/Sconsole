@@ -391,7 +391,7 @@ async function openAgentChat(instanceId, agentId, agentName) {
     $('#chat-agent-name').textContent = agentName || agent.name || `Agent #${agentId}`;
     $('#chat-agent-name').dataset.agentId = agentId;
 
-    if (sameAgent && state.chatMessages.length > 0) {
+    if (0) {//sameAgent && state.chatMessages.length > 0) {
         // Re-render existing messages from state (streaming may still be in progress)
         $('#chat-messages').innerHTML = '';
         state.chatMessages.forEach(msg => {
@@ -439,12 +439,26 @@ async function openAgentChat(instanceId, agentId, agentName) {
                             }
                         }
                         if (text) {
-                            addChatMessage('agent', text);
+                            if (conv.status === 'streaming' || conv.status === 'pending') {
+                                addChatMessage('agent', text, { convId: conv.id });
+                            } else {
+                                addChatMessage('agent', text);
+                            }
                             state.chatMessages.push({ role: 'assistant', content: text });
+                        } else if (conv.status === 'pending') {
+                            addChatMessage('system', '⏳ Agent 正在处理中...', { convId: conv.id });
+                        } else if (conv.status === 'streaming') {
+                            addChatMessage('system', '⏳ 回复生成中...', { convId: conv.id });
                         } else if (conv.error_msg) {
                             addChatMessage('system', `⚠️ ${conv.error_msg.substring(0, 200)}`);
                         }
                         state._shownConversationIds.add(conv.id);
+                    }
+
+                    // ── Start polling for in-progress records ──
+                    const inProgress = dbConvs.filter(c => c.status === 'streaming' || c.status === 'pending');
+                    if (inProgress.length > 0) {
+                        startRecoveryPoll(instanceId, agentId);
                     }
                 }
             }
@@ -660,12 +674,26 @@ async function switchConversation(convId, workspaceId) {
                             }
                         }
                         if (text) {
-                            addChatMessage('agent', text);
+                            if (conv.status === 'streaming' || conv.status === 'pending') {
+                                addChatMessage('agent', text, { convId: conv.id });
+                            } else {
+                                addChatMessage('agent', text);
+                            }
                             state.chatMessages.push({ role: 'assistant', content: text });
+                        } else if (conv.status === 'pending') {
+                            addChatMessage('system', '⏳ Agent 正在处理中...', { convId: conv.id });
+                        } else if (conv.status === 'streaming') {
+                            addChatMessage('system', '⏳ 回复生成中...', { convId: conv.id });
                         } else if (conv.error_msg) {
                             addChatMessage('system', `⚠️ ${conv.error_msg.substring(0, 200)}`);
                         }
                         state._shownConversationIds.add(conv.id);
+                    }
+
+                    // Start recovery poll for in-progress records
+                    const inProgress = matching.filter(c => c.status === 'streaming' || c.status === 'pending');
+                    if (inProgress.length > 0) {
+                        startRecoveryPoll(workspaceId, agentId);
                     }
                 } else {
                     addChatMessage('system', '未找到该会话记录。');
@@ -1044,8 +1072,28 @@ async function syncConversationFromDB(instanceId, masterAgentId, pendingEl, http
             if (text && text !== httpReply) {
                 // New conversation with content — show in chat
                 if (pendingEl && pendingEl.parentNode) pendingEl.remove();
-                addChatMessage('agent', text);
+                if (conv.status === 'streaming' || conv.status === 'pending') {
+                    addChatMessage('agent', text, { convId: convId });
+                } else {
+                    addChatMessage('agent', text);
+                }
                 state.chatMessages.push({ role: 'assistant', content: text });
+                state._shownConversationIds.add(convId);
+                foundNew = true;
+            } else if (!text && conv.status === 'streaming' && !httpReply) {
+                // Streaming but no text yet
+                if (pendingEl && pendingEl.parentNode) {
+                    pendingEl.textContent = '⏳ 回复生成中...';
+                    pendingEl.dataset.convId = convId;
+                }
+                state._shownConversationIds.add(convId);
+                foundNew = true;
+            } else if (!text && conv.status === 'pending' && !httpReply) {
+                // Agent hasn't started responding yet
+                if (pendingEl && pendingEl.parentNode) {
+                    pendingEl.textContent = '⏳ Agent 正在处理中...';
+                    pendingEl.dataset.convId = convId;
+                }
                 state._shownConversationIds.add(convId);
                 foundNew = true;
             } else if (conv.error_msg && !httpReply) {
@@ -1095,11 +1143,102 @@ function handleChatKey(event) {
     setTimeout(() => { const ta = event.target; ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'; }, 0);
 }
 
-function addChatMessage(type, content) {
+function addChatMessage(type, content, attrs) {
     const div = document.createElement('div');
     div.className = `chat-msg ${type}`;
     div.textContent = content;
+    if (attrs) {
+        for (const [k, v] of Object.entries(attrs)) {
+            div.dataset[k] = v;
+        }
+    }
     const ctr = $('#chat-messages'); ctr.appendChild(div); ctr.scrollTop = ctr.scrollHeight;
+    return div;
+}
+
+// ─── Recovery Poll: update in-progress messages from DB ───────────
+// When a user re-enters a chat that has streaming/pending records,
+// this polls the DB every 3s and updates the message elements in place.
+
+function startRecoveryPoll(instanceId, agentId) {
+    // Always clear any existing timer first
+    if (state.chatPollTimer) { clearInterval(state.chatPollTimer); state.chatPollTimer = null; }
+
+    state.chatPollTimer = setInterval(async () => {
+        try {
+            const resp = await fetch(`/api/workspaces/${instanceId}/agents/${agentId}/conversations?limit=200`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const convs = data.conversations || [];
+            let allDone = true;
+
+            for (const conv of convs) {
+                if (conv.status !== 'streaming' && conv.status !== 'pending') continue;
+                allDone = false;
+
+                // Extract text from output
+                let text = '';
+                for (const step of (conv.output || [])) {
+                    if (step.type === 'message' && step.content) {
+                        for (const part of step.content) {
+                            if (part.text) text += part.text;
+                        }
+                    }
+                }
+
+                // Find the DOM element for this record
+                const el = document.querySelector(`[data-conv-id="${conv.id}"]`);
+                if (!el) continue;
+
+                if (text) {
+                    // Update existing message with latest text
+                    el.className = 'chat-msg agent';
+                    el.textContent = text;
+                } else if (conv.status === 'pending') {
+                    el.textContent = '⏳ Agent 正在处理中...';
+                } else {
+                    el.textContent = '⏳ 回复生成中...';
+                }
+            }
+
+            // Also check: did any previously-in-progress record finish?
+            const finished = convs.filter(c =>
+                (c.status === 'completed' || c.status === 'error') &&
+                document.querySelector(`[data-conv-id="${c.id}"]`)
+            );
+            for (const conv of finished) {
+                const el = document.querySelector(`[data-conv-id="${conv.id}"]`);
+                if (!el) continue;
+
+                let text = '';
+                for (const step of (conv.output || [])) {
+                    if (step.type === 'message' && step.content) {
+                        for (const part of step.content) {
+                            if (part.text) text += part.text;
+                        }
+                    }
+                }
+                if (text) {
+                    el.className = 'chat-msg agent';
+                    el.textContent = text;
+                } else if (conv.error_msg) {
+                    el.className = 'chat-msg system';
+                    el.textContent = `⚠️ ${conv.error_msg.substring(0, 200)}`;
+                }
+                // Remove data-conv-id so it won't be updated again
+                delete el.dataset.convId;
+            }
+
+            // Stop polling if no more in-progress records
+            if (allDone && finished.length === 0) {
+                clearInterval(state.chatPollTimer);
+                state.chatPollTimer = null;
+                saveChatToStorage();
+            }
+        } catch (e) {
+            // Network error — keep trying
+        }
+    }, 3000);
 }
 
 function saveChatToStorage() {
@@ -1205,12 +1344,14 @@ function renderConfigs() {
     if (!state.configs.length) { container.innerHTML = '<div class="empty-state">暂无配置。</div>'; return; }
     container.innerHTML = state.configs.map(cfg => {
         const providerLabel = cfg.model_provider ? ` | 供应商: ${esc(cfg.model_provider)}` : '';
+        const keyDisplay = cfg.model_api_key || '(未设置)';
         return `<div class="config-card">
             <div class="card-info">
                 <div class="card-name">${esc(cfg.name)} (#${cfg.id})</div>
-                <div class="card-meta">模型: ${cfg.model_name || 'N/A'}${providerLabel} | 技能: ${(cfg.skills || []).length}</div>
+                <div class="card-meta">模型: ${cfg.model_name || 'N/A'}${providerLabel} | 技能: ${(cfg.skills || []).length} | Key: ${esc(keyDisplay)}</div>
             </div>
             <div class="card-actions">
+                <button class="btn btn-sm" onclick="cloneConfig(${cfg.id})" title="克隆此配置">📋 克隆</button>
                 <button class="btn btn-sm" onclick="editConfig(${cfg.id})">编辑</button>
                 <button class="btn btn-sm btn-danger" onclick="deleteConfig(${cfg.id})">删除</button>
             </div>
@@ -1230,7 +1371,15 @@ function renderConfigs() {
     state.configs.forEach(cfg => loadConfigFiles(cfg.id));
 }
 
-function showConfigForm() { $('#config-form').reset(); $('#config-form').elements.config_id.value = ''; $('#config-form-title').textContent = '创建配置'; $('#config-form-panel').classList.remove('hidden'); setTimeout(()=>{const el=$('#config-form').elements.name; if(el)el.focus();},100); }
+function showConfigForm() {
+    $('#config-form').reset(); $('#config-form').elements.config_id.value = '';
+    $('#config-form-title').textContent = '创建配置';
+    $('#config-form').elements.model_api_key.placeholder = 'sk-...';
+    const hintEl = document.getElementById('api-key-hint');
+    if (hintEl) hintEl.textContent = '';
+    $('#config-form-panel').classList.remove('hidden');
+    setTimeout(()=>{const el=$('#config-form').elements.name; if(el)el.focus();},100);
+}
 function onProviderChange(provider) {
     const urlInput = $('#config-form').elements.model_url;
     if (provider && PROVIDER_DEFAULT_URLS[provider] && !urlInput.value) {
@@ -1283,7 +1432,11 @@ async function editConfig(id) {
     f.elements.model_url.value = cfg.model_url; f.elements.model_name.value = cfg.model_name;
     f.elements.model_provider.value = cfg.model_provider || '';
     f.elements.proxy.value = cfg.proxy || '';
-    f.elements.model_api_key.value = cfg.model_api_key;
+    // API Key: show masked value in hint, leave input empty (=don't change)
+    f.elements.model_api_key.value = '';
+    f.elements.model_api_key.placeholder = '留空则不修改';
+    const hintEl = document.getElementById('api-key-hint');
+    if (hintEl) hintEl.textContent = `当前: ${cfg.model_api_key || '(未设置)'} — 留空不修改`;
     f.elements.skills_str.value = (cfg.skills || []).join(', ');
     $('#config-form-title').textContent = `编辑配置 #${id}`;
     $('#config-form-panel').classList.remove('hidden');
@@ -1307,9 +1460,58 @@ async function saveConfig(event) {
 }
 
 async function deleteConfig(configId) {
-    if (!confirm(`删除配置 #${configId}？`)) return;
+    // Check agent references before deleting
+    const refData = await fetchAPI(`/api/configs/${configId}/refs`);
+    const refs = (refData && refData.refs) || [];
+    let msg = `确定删除配置 #${configId}？`;
+    if (refs.length > 0) {
+        msg = `配置 #${configId} 被以下 ${refs.length} 个 Agent 引用:\n\n`;
+        refs.forEach(r => {
+            msg += `  • [${r.workspace_name}] ${r.agent_name} (${r.role}, ${r.status})\n`;
+        });
+        msg += `\n删除后这些 Agent 将无法重新部署。确定继续？`;
+    }
+    if (!confirm(msg)) return;
     await fetchAPI(`/api/configs/${configId}`, { method: 'DELETE' });
     refreshConfigs();
+}
+
+async function cloneConfig(id) {
+    const cfg = await fetchAPI(`/api/configs/${id}`); if (!cfg) return;
+    const f = $('#config-form');
+    f.elements.config_id.value = '';  // new config, not update
+    f.elements.name.value = cfg.name + ' (副本)';
+    f.elements.soul_file.value = cfg.soul_file || '';
+    f.elements.memory_file.value = cfg.memory_file || '';
+    f.elements.tech_docs.value = cfg.tech_docs || '';
+    f.elements.model_url.value = cfg.model_url || '';
+    f.elements.model_name.value = cfg.model_name || '';
+    f.elements.model_provider.value = cfg.model_provider || '';
+    f.elements.proxy.value = cfg.proxy || '';
+    // Don't copy API key — user must enter their own
+    f.elements.model_api_key.value = '';
+    f.elements.model_api_key.placeholder = '请输入新的 API Key';
+    const hintEl = document.getElementById('api-key-hint');
+    if (hintEl) hintEl.textContent = '已从配置 #' + id + ' 克隆，API Key 需重新填写';
+    f.elements.skills_str.value = (cfg.skills || []).join(', ');
+    $('#config-form-title').textContent = `克隆配置 #${id}`;
+    $('#config-form-panel').classList.remove('hidden');
+    setTimeout(()=>{const el=f.elements.name; if(el)el.focus();},100);
+}
+
+function loadTextFile(input, fieldName) {
+    const file = input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        const textarea = $('#config-form').elements[fieldName];
+        if (textarea) {
+            textarea.value = e.target.result;
+            addLog(`已从 "${file.name}" 加载内容到 ${fieldName}`, 'success');
+        }
+    };
+    reader.readAsText(file);
+    input.value = '';  // reset so same file can be re-selected
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1697,7 +1899,7 @@ function openMonitor(instanceId, agentId) {
         if (state._monitorInstanceId && state._monitorAgentId) {
             loadMonitorConversations(state._monitorInstanceId, state._monitorAgentId);
         }
-    }, 5000);
+    }, 600000);
 }
 
 function closeMonitor() {

@@ -5,6 +5,7 @@ import json
 import uuid
 import os
 import shutil
+import time
 import asyncio
 import httpx
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form
@@ -69,6 +70,12 @@ def delete_config(config_id: int):
     if not ok:
         raise HTTPException(status_code=404, detail="Config not found")
     return {"message": "Config deleted"}
+
+
+@router.get("/api/configs/{config_id}/refs")
+def get_config_refs(config_id: int):
+    """Get all agents referencing this config."""
+    return {"refs": AgentService.get_config_agent_refs(config_id)}
 
 
 # ─── Config File Upload ──────────────────────────────────────────────
@@ -188,33 +195,27 @@ async def delete_workspace(workspace_id: int):
     agents = AgentService.list_instance_agents(workspace_id)
     inst = AgentService.get_instance(workspace_id)  # fetch BEFORE deleting
     node_id = inst["node_id"] if inst else ""
+    agent_ids = [a["id"] for a in agents]
 
-    for agent in agents:
-        if agent["status"] in ("running", "pending"):
-            if node_id:
-                await manager.send_to_node(node_id, {
-                    "type": "stop_agent",
-                    "workspace_id": workspace_id,
-                    "agent_id": agent["id"],
-                })
+    # Send a single clean_workspace command to node — handles containers,
+    # volumes, shared dirs, intercom artifacts all at once
+    if node_id:
+        await manager.send_to_node(node_id, {
+            "type": "clean_workspace",
+            "workspace_id": workspace_id,
+            "agent_ids": agent_ids,
+        })
+
+    # Cascade-delete DB records (agents, conversations, messages, workspace)
     AgentService.delete_instance(workspace_id)
 
-    # Clean up uploaded files
+    # Clean up server-side uploaded files
     import shutil
     upload_dir = _get_upload_dir(workspace_id)
     if os.path.isdir(upload_dir):
         shutil.rmtree(upload_dir, ignore_errors=True)
 
-    # Clean up intercom artifacts via node agent
-    agent_ids = [a["id"] for a in agents]
-    if node_id:
-        await manager.send_to_node(node_id, {
-            "type": "clean_intercom",
-            "workspace_id": workspace_id,
-            "agent_ids": agent_ids,
-        })
-
-    return {"message": "工作空间已删除"}
+    return {"message": "工作空间已删除", "cleaned_agents": len(agent_ids)}
 
 
 # ═══ Backward-compatible /api/instances routes (redirect to workspaces) ═══
@@ -1154,10 +1155,52 @@ async def api_communicate(data: dict):
             return {"code": 500, "status": "error", "conversation_id": conversation_id or "", "output": [], "error": error_msg}
 
     # ── Streaming mode (default) ──
-    async def sse_stream():
-        """Proxy SSE events from Hermes, accumulate output for DB."""
+    # We use an asyncio.Queue + background task pattern so that:
+    #   - The SSE generator reads from the queue and yields to the client
+    #   - A background task drains the Hermes stream, writes DB, and pushes to queue
+    #   - If the client disconnects, the SSE generator stops but the background
+    #     task continues until the Hermes stream completes, ensuring DB is updated.
+    sse_queue = asyncio.Queue()
+
+    async def _hermes_drain_task():
+        """Background task: consume Hermes SSE stream, update DB, push to queue."""
         accumulated_output = []
         accumulated_usage = {}
+        accumulated_text = ""
+        data_line_count = 0
+        last_db_flush = time.time()
+        DB_FLUSH_INTERVAL = 5
+        DB_FLUSH_LINES = 5
+
+        def _should_flush_db():
+            return (data_line_count > 0 and data_line_count % DB_FLUSH_LINES == 0) \
+                or (time.time() - last_db_flush >= DB_FLUSH_INTERVAL and data_line_count > 0)
+
+        def _do_flush_db(status="streaming"):
+            nonlocal last_db_flush, data_line_count
+            partial_output = list(accumulated_output) if accumulated_output else []
+            if accumulated_text and not any(
+                o.get("type") == "message" and
+                any(c.get("type") == "output_text" for c in (o.get("content") if isinstance(o.get("content"), list) else []))
+                for o in partial_output
+            ):
+                partial_output.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": accumulated_text}],
+                })
+            try:
+                AgentService.update_conversation_record(
+                    record_id=record_id,
+                    output=partial_output,
+                    usage_info=accumulated_usage,
+                    status=status,
+                )
+                last_db_flush = time.time()
+                data_line_count = 0
+            except Exception:
+                pass
+
         try:
             async with httpx.AsyncClient(timeout=600.0) as client:
                 async with client.stream("POST", hermes_url, json=payload, headers=headers) as resp:
@@ -1171,23 +1214,38 @@ async def api_communicate(data: dict):
                             )
                         except Exception:
                             pass
-                        yield f"event: error\ndata: {{\"error\": \"{error_msg}\"}}\n\n"
+                        await sse_queue.put(f"event: error\ndata: {{\"error\": \"{error_msg}\"}}\n\n")
                         return
 
                     async for line in resp.aiter_lines():
-                        yield line + "\n"
+                        # Push to queue for SSE forwarding
+                        await sse_queue.put(line + "\n")
 
                         if line.startswith("data: "):
+                            data_line_count += 1
                             try:
                                 evt = json.loads(line[6:])
-                                if evt.get("type") == "response.completed":
+                                evt_type = evt.get("type", "")
+
+                                if evt_type == "response.output_text.delta":
+                                    accumulated_text += evt.get("delta", "")
+                                elif evt_type == "response.output_text.done":
+                                    accumulated_text = evt.get("text", accumulated_text)
+                                elif evt_type == "response.output_item.done":
+                                    item = evt.get("item")
+                                    if item:
+                                        accumulated_output.append(item)
+                                elif evt_type == "response.completed":
                                     resp_data = evt.get("response", {})
-                                    accumulated_output = resp_data.get("output", [])
-                                    accumulated_usage = resp_data.get("usage", {})
+                                    accumulated_output = resp_data.get("output", accumulated_output)
+                                    accumulated_usage = resp_data.get("usage", accumulated_usage)
                             except json.JSONDecodeError:
                                 pass
 
-                    # After stream completes, update DB
+                            if _should_flush_db():
+                                _do_flush_db()
+
+                    # Stream completed — final DB update
                     try:
                         AgentService.update_conversation_record(
                             record_id=record_id,
@@ -1200,6 +1258,7 @@ async def api_communicate(data: dict):
 
         except httpx.ConnectError:
             error_msg = f"Cannot connect to hermes agent at port {agent_port}"
+            _do_flush_db(status="error")
             try:
                 AgentService.update_conversation_record(
                     record_id=record_id, output=[], usage_info={},
@@ -1207,9 +1266,10 @@ async def api_communicate(data: dict):
                 )
             except Exception:
                 pass
-            yield f"event: error\ndata: {{\"error\": \"{error_msg}\"}}\n\n"
+            await sse_queue.put(f"event: error\ndata: {{\"error\": \"{error_msg}\"}}\n\n")
         except Exception as e:
             error_msg = str(e)
+            _do_flush_db(status="error")
             try:
                 AgentService.update_conversation_record(
                     record_id=record_id, output=accumulated_output,
@@ -1217,7 +1277,26 @@ async def api_communicate(data: dict):
                 )
             except Exception:
                 pass
-            yield f"event: error\ndata: {{\"error\": \"{error_msg}\"}}\n\n"
+            await sse_queue.put(f"event: error\ndata: {{\"error\": \"{error_msg}\"}}\n\n")
+        finally:
+            # Signal end of stream
+            await sse_queue.put(None)
+
+    # Launch background drain task
+    drain_task = asyncio.create_task(_hermes_drain_task())
+
+    async def sse_stream():
+        """Read from queue and yield SSE chunks to the client."""
+        try:
+            while True:
+                chunk = await sse_queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client disconnected — drain_task keeps running in background
+            # to finish consuming Hermes stream and update DB.
+            raise
 
     return StreamingResponse(sse_stream(), media_type="text/event-stream")
 
