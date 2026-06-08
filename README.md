@@ -51,3 +51,44 @@ http://192.168.34.4:7890
 oceanbase-mysql数据库：[ ip/port=192.168.34.65/2881 database=mysql Tenant=sys user=root passwd=Info@1234 ]
 可以使用mysql命令连接，如：mysql -h192.168.34.65 -P2881 -uroot -pInfo@1234
 ```
+
+# 启动说明
+```
+Sconsole 手动启动步骤
+0. 前提：启动 Podman Socket
+
+bash
+如果 podman socket 未运行（先检查）
+ls /tmp/podman-user.sock
+不存在则启动
+podman system service --time=0 unix:///tmp/podman-user.sock &
+
+1. 启动 Sconsole 服务端
+
+bash
+cd /home/dpfs/github/Sconsole
+前台运行（终端会占用，方便观察日志）
+.venv/bin/python3 -m uvicorn server.main:app --host 0.0.0.0 --port 58091 --log-level info
+或后台运行
+nohup .venv/bin/python3 -m uvicorn server.main:app --host 0.0.0.0 --port 58091 --log-level info > /tmp/sconsole_server.log 2>&1 &
+
+验证：curl -s http://localhost:58091/ 返回 200。
+2. 启动 Node Agent
+
+bash
+cd /home/dpfs/github/Sconsole
+
+.venv/bin/python3 node/agent.py --server ws://localhost:58091 --node-id node-1
+
+验证：curl -s http://localhost:58091/api/nodes 返回 node-1 online。
+端口说明
+
+| 组件            | 端口   | 说明                                        |
+|-----------------|--------|---------------------------------------------|
+| Sconsole Server | 58091  | FastAPI + WebSocket                         |
+| Agent 容器      | 18001+ | 每个 Agent 动态分配 host_port → 容器内 8642 |
+数据库
+
+MySQL：xxx.xxx.xxx.xxx:3306 / 库 SCL_sconsole
+
+```
